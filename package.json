@@ -1,0 +1,13 @@
+{
+  "name": "downasaur",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "dev": "pnpm --filter @downasaur/desktop tauri dev",
+    "build": "pnpm --filter @downasaur/desktop tauri build",
+    "web:dev": "pnpm --filter @downasaur/desktop dev",
+    "web:build": "pnpm --filter @downasaur/desktop build",
+    "typecheck": "pnpm --filter @downasaur/desktop typecheck",
+    "check": "pnpm typecheck && pnpm web:build && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace"
+  }
+}
