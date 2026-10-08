@@ -104,11 +104,20 @@ pub const CLIENTS: &[InnerTubeClient] = &[
     },
 ];
 
+/// Clients to try, in order. `DOWNASAUR_YT_CLIENTS=TVHTML5` narrows and
+/// reorders [`CLIENTS`] (for debugging a single client).
+fn client_chain() -> Vec<&'static InnerTubeClient> {
+    let only = std::env::var("DOWNASAUR_YT_CLIENTS").unwrap_or_default();
+    let chain: Vec<_> =
+        only.split(',').filter_map(|n| CLIENTS.iter().find(|c| c.name.eq_ignore_ascii_case(n.trim()))).collect();
+    if chain.is_empty() { CLIENTS.iter().collect() } else { chain }
+}
+
 /// Try each client in [`CLIENTS`] order and return the first playable result.
 async fn extract_video(ctx: &ExtractContext, source: &Url, id: &str, kind: ContentKind) -> Result<MediaInfo> {
     let visitor = visitor_data(ctx).await;
     let mut first_err = None;
-    for client in CLIENTS {
+    for client in client_chain() {
         match extract_with_client(ctx, source, id, kind, client, visitor.as_deref()).await {
             Ok(info) if !info.formats.is_empty() => {
                 tracing::debug!(client = client.name, formats = info.formats.len(), "youtube client succeeded");
