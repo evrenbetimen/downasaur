@@ -6,15 +6,21 @@
 //! Sub-modules:
 //! - [`urls`]: URL classification (watch / shorts / live / playlist / channel).
 //! - [`formats`]: `streamingData` → [`StreamFormat`] mapping and best-format selection.
-//! - [`cipher`]: `signatureCipher` unpacking and transform-program evaluation.
+//! - [`cipher`]: `signatureCipher` unpacking.
+//! - [`jsc`]: player-script challenge solver (`n` throttling + signatures).
 //! - [`playlist`]: playlist/channel crawling with continuation tokens.
 
 pub mod cipher;
 pub mod formats;
+pub mod jsc;
 pub mod playlist;
 pub mod urls;
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
+use parking_lot::Mutex;
+use regex::Regex;
 use serde_json::{Value, json};
 use url::Url;
 
@@ -27,6 +33,9 @@ use urls::YouTubeUrl;
 
 const NAME: &str = "YouTube";
 const PLAYER_ENDPOINT: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+/// Visitor id shared by every player request of this process; see [`visitor_data`].
+static VISITOR_DATA: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct YouTubeExtractor;
@@ -44,10 +53,7 @@ impl PlatformExtractor for YouTubeExtractor {
     async fn extract(&self, ctx: &ExtractContext, url: &Url) -> Result<Extraction> {
         match urls::classify(url) {
             Some(YouTubeUrl::Video { id, kind }) => {
-                let player = fetch_player_response(ctx, &id).await?;
-                let mut info = parse_player_response(&player, url, kind)?;
-                formats::resolve_ciphers(ctx, &mut info, &player).await?;
-                Ok(Extraction::Media(Box::new(info)))
+                extract_video(ctx, url, &id, kind).await.map(|m| Extraction::Media(Box::new(m)))
             }
             Some(YouTubeUrl::Playlist { list }) => playlist::crawl_playlist(ctx, &list).await,
             Some(YouTubeUrl::Channel { path }) => playlist::crawl_channel(ctx, &path).await,
@@ -56,29 +62,180 @@ impl PlatformExtractor for YouTubeExtractor {
     }
 }
 
+/// An InnerTube client identity. Each client gets a different set of formats and
+/// different protection: some need the web player's JS transforms, some don't.
+#[derive(Debug, Clone, Copy)]
+pub struct InnerTubeClient {
+    pub name: &'static str,
+    /// Numeric id sent as `X-YouTube-Client-Name`.
+    pub id: u32,
+    pub version: &'static str,
+    pub user_agent: &'static str,
+    pub extra: &'static [(&'static str, &'static str)],
+    /// Stream URLs carry `n` (and possibly `signatureCipher`) challenges that need
+    /// the player script.
+    pub needs_player_js: bool,
+}
+
+/// visionOS returns adaptive formats with plain URLs and no proof-of-origin token
+/// requirement. TV is the fallback (e.g. for videos visionOS refuses); its URLs
+/// need the `n`/signature transforms from the player script.
+pub const CLIENTS: &[InnerTubeClient] = &[
+    InnerTubeClient {
+        name: "VISIONOS",
+        id: 101,
+        version: "1.02",
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        extra: &[
+            ("deviceMake", "Apple"),
+            ("deviceModel", "RealityDevice17,1"),
+            ("osName", "visionOS"),
+            ("osVersion", "26.5.23O471"),
+        ],
+        needs_player_js: false,
+    },
+    InnerTubeClient {
+        name: "TVHTML5",
+        id: 7,
+        version: "5.20260707",
+        user_agent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+        extra: &[],
+        needs_player_js: true,
+    },
+];
+
+/// Try each client in [`CLIENTS`] order and return the first playable result.
+async fn extract_video(ctx: &ExtractContext, source: &Url, id: &str, kind: ContentKind) -> Result<MediaInfo> {
+    let visitor = visitor_data(ctx).await;
+    let mut first_err = None;
+    for client in CLIENTS {
+        match extract_with_client(ctx, source, id, kind, client, visitor.as_deref()).await {
+            Ok(info) if !info.formats.is_empty() => {
+                tracing::debug!(client = client.name, formats = info.formats.len(), "youtube client succeeded");
+                return Ok(info);
+            }
+            Ok(_) => tracing::debug!(client = client.name, "youtube client returned no formats"),
+            // DRM is a property of the title, not of the client: report it right away.
+            Err(e @ CoreError::DrmProtected(_)) => return Err(e),
+            Err(e) => {
+                tracing::debug!(client = client.name, error = %e, "youtube client failed");
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| CoreError::FormatUnavailable("no downloadable YouTube formats".into())))
+}
+
+async fn extract_with_client(
+    ctx: &ExtractContext,
+    source: &Url,
+    id: &str,
+    kind: ContentKind,
+    client: &InnerTubeClient,
+    visitor: Option<&str>,
+) -> Result<MediaInfo> {
+    let script = if client.needs_player_js { Some(jsc::PlayerScript::load(&ctx.http).await?) } else { None };
+    let sts = script.as_ref().and_then(|s| s.signature_timestamp);
+    let player = fetch_player_response(ctx, id, client, sts, visitor).await?;
+    let mut info = parse_player_response(&player, source, kind)?;
+    if let Some(script) = &script {
+        formats::solve_challenges(&mut info, &player, script).await?;
+    }
+    // googlevideo checks that the downloader looks like the client that asked.
+    for f in &mut info.formats {
+        f.headers.push(("User-Agent".into(), client.user_agent.into()));
+    }
+    Ok(info)
+}
+
+/// A visitor id (`VISITOR_DATA` from the homepage's `ytcfg`). Anonymous player
+/// requests without one are answered with "Sign in to confirm you're not a bot",
+/// even from residential IPs. Fetched once per process; `None` if the page changed.
+async fn visitor_data(ctx: &ExtractContext) -> Option<String> {
+    if let Some(v) = VISITOR_DATA.lock().clone() {
+        return Some(v);
+    }
+    let home = Url::parse("https://www.youtube.com/").ok()?;
+    let html = match ctx.http.get_text(&home, DeviceClass::Desktop).await {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::debug!(error = %e, "youtube visitor data fetch failed");
+            return None;
+        }
+    };
+    let visitor = parse_visitor_data(&html);
+    if visitor.is_none() {
+        tracing::debug!("youtube homepage carried no VISITOR_DATA");
+    }
+    VISITOR_DATA.lock().clone_from(&visitor);
+    visitor
+}
+
+fn parse_visitor_data(html: &str) -> Option<String> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""VISITOR_DATA":"([^"]+)""#).expect("valid regex"));
+    RE.captures(html).map(|c| c[1].to_owned())
+}
+
 /// Query the InnerTube player endpoint for a video's `playerResponse`.
-async fn fetch_player_response(ctx: &ExtractContext, video_id: &str) -> Result<Value> {
+async fn fetch_player_response(
+    ctx: &ExtractContext,
+    video_id: &str,
+    client: &InnerTubeClient,
+    signature_timestamp: Option<u64>,
+    visitor: Option<&str>,
+) -> Result<Value> {
     let endpoint = Url::parse(PLAYER_ENDPOINT)?;
-    let body = json!({
-        "videoId": video_id,
-        "context": { "client": { "clientName": "WEB", "clientVersion": "2.20260901.00.00", "hl": "en" } },
-        "playbackContext": { "contentPlaybackContext": { "html5Preference": "HTML5_PREF_WANTS" } },
-        "contentCheckOk": true,
-        "racyCheckOk": true
-    });
+    let body = player_request_body(video_id, client, signature_timestamp, visitor);
     let resp = ctx
         .http
         .send_with_retry(|pool| {
-            pool.get(&endpoint, DeviceClass::Desktop).json(&body).header("Origin", "https://www.youtube.com")
+            let req = pool
+                .client()
+                .post(endpoint.clone())
+                .json(&body)
+                .header("User-Agent", client.user_agent)
+                .header("X-YouTube-Client-Name", client.id.to_string())
+                .header("X-YouTube-Client-Version", client.version)
+                .header("Origin", "https://www.youtube.com");
+            match visitor {
+                Some(v) => req.header("X-Goog-Visitor-Id", v),
+                None => req,
+            }
         })
         .await?;
     Ok(resp.json().await?)
 }
 
+fn player_request_body(
+    video_id: &str,
+    client: &InnerTubeClient,
+    signature_timestamp: Option<u64>,
+    visitor: Option<&str>,
+) -> Value {
+    let mut client_ctx = json!({ "clientName": client.name, "clientVersion": client.version, "hl": "en", "userAgent": client.user_agent });
+    for (k, v) in client.extra {
+        client_ctx[*k] = json!(v);
+    }
+    if let Some(v) = visitor {
+        client_ctx["visitorData"] = json!(v);
+    }
+    let mut playback = json!({ "html5Preference": "HTML5_PREF_WANTS" });
+    if let Some(sts) = signature_timestamp {
+        playback["signatureTimestamp"] = json!(sts);
+    }
+    json!({
+        "videoId": video_id,
+        "context": { "client": client_ctx },
+        "playbackContext": { "contentPlaybackContext": playback },
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    })
+}
+
 /// Turn an InnerTube `playerResponse` into [`MediaInfo`].
 ///
 /// Formats that still carry a `signatureCipher` keep their raw base URL here;
-/// [`formats::resolve_ciphers`] rewrites them once the player program is known.
+/// [`formats::solve_challenges`] adds them once the player transforms are solved.
 pub fn parse_player_response(player: &Value, source: &Url, kind: ContentKind) -> Result<MediaInfo> {
     match at_str(player, "playabilityStatus/status") {
         Some("OK") | None => {}
@@ -188,6 +345,25 @@ mod tests {
         assert_eq!(info.formats.len(), 3);
         assert_eq!(info.thumbnail.as_ref().map(Url::as_str), Some("https://i.ytimg.com/vi/a/max.jpg"));
         assert!(info.subtitles[0].auto_generated);
+    }
+
+    #[test]
+    fn request_body_carries_client_identity() {
+        let body = player_request_body("abcdefghijk", &CLIENTS[0], None, Some("CgtWaXNpdG9y"));
+        assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
+        assert_eq!(body["context"]["client"]["deviceModel"], "RealityDevice17,1");
+        assert_eq!(body["context"]["client"]["visitorData"], "CgtWaXNpdG9y");
+        assert!(body["playbackContext"]["contentPlaybackContext"].get("signatureTimestamp").is_none());
+        let body = player_request_body("abcdefghijk", &CLIENTS[1], Some(20367), None);
+        assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20367);
+        assert!(body["context"]["client"].get("visitorData").is_none());
+    }
+
+    #[test]
+    fn visitor_data_is_read_from_ytcfg() {
+        let html = r#"<script>ytcfg.set({"INNERTUBE_API_KEY":"x","VISITOR_DATA":"CgtLeDdPd2Z0TzEtVSjX75vWBg%3D%3D","HL":"en"});</script>"#;
+        assert_eq!(parse_visitor_data(html).as_deref(), Some("CgtLeDdPd2Z0TzEtVSjX75vWBg%3D%3D"));
+        assert_eq!(parse_visitor_data("<html></html>"), None);
     }
 
     #[test]
