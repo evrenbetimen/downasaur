@@ -117,6 +117,7 @@ pub fn parse_item(item: &Value, source: &Url) -> Result<MediaInfo> {
         content_kind: ContentKind::Short,
         formats,
         subtitles: Vec::new(),
+        warnings: Vec::new(),
     })
 }
 

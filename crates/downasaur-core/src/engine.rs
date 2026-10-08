@@ -362,17 +362,35 @@ impl Engine {
         };
         let picked = selection::select(&info, &task.profile)?;
 
-        self.set_state(id, TaskState::Downloading, None)?;
+        let warning = (!info.warnings.is_empty()).then(|| info.warnings.join("; "));
+        self.set_state(id, TaskState::Downloading, warning)?;
         let counter = ByteCounter::new(inner.db.load_chunks(id).map(|c| chunks::bytes_done(&c)).unwrap_or(0));
         let reporter = self.spawn_reporter(id, counter.clone(), cancel.child_token());
 
-        let video_path = match &picked.video {
-            Some(f) => Some(self.fetch_stream(id, f, "v", 0, &counter, cancel).await?),
-            None => None,
+        // Live renditions are recorded side by side from one shared starting
+        // segment; fetched one after the other, the audio would come from later.
+        let live_start = Mutex::new(None);
+        let video = async {
+            match &picked.video {
+                Some(f) => self.fetch_stream(id, f, "v", 0, &counter, cancel, &live_start).await.map(Some),
+                None => Ok(None),
+            }
         };
-        let audio_path = match &picked.audio {
-            Some(f) => Some(self.fetch_stream(id, f, "a", AUDIO_CHUNK_BASE, &counter, cancel).await?),
-            None => None,
+        let audio = async {
+            match &picked.audio {
+                Some(f) => {
+                    self.fetch_stream(id, f, "a", AUDIO_CHUNK_BASE, &counter, cancel, &live_start).await.map(Some)
+                }
+                None => Ok(None),
+            }
+        };
+        let is_live =
+            |f: &Option<StreamFormat>| f.as_ref().is_some_and(|f| f.transport == Transport::Hls { live: true });
+        let (video_path, audio_path) = if is_live(&picked.video) || is_live(&picked.audio) {
+            tokio::try_join!(video, audio)?
+        } else {
+            let video = video.await?;
+            (video, audio.await?)
         };
         reporter.cancel();
 
@@ -485,6 +503,7 @@ impl Engine {
         handle
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_stream(
         &self,
         id: Uuid,
@@ -493,6 +512,7 @@ impl Engine {
         chunk_base: u32,
         counter: &ByteCounter,
         cancel: &CancellationToken,
+        live_start: &Mutex<Option<u64>>,
     ) -> Result<PathBuf> {
         let inner = &self.inner;
         let dest = inner.temp_dir.join(format!("{id}.{tag}.{}", format.container));
@@ -509,6 +529,8 @@ impl Engine {
                     limiter: &inner.limiter,
                     counter,
                     cancel,
+                    max_duration: inner.options.live_max_duration,
+                    live_start: Some(live_start),
                 }
                 .run()
                 .await?;

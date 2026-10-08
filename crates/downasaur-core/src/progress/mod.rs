@@ -41,18 +41,31 @@ impl ProgressEvent {
 
 #[derive(Debug, Clone, Default)]
 pub struct ProgressHub {
-    pending: Arc<Mutex<HashMap<(Uuid, u8), ProgressEvent>>>,
+    pending: Arc<Mutex<Pending>>,
+}
+
+/// Latest event per (task, kind), tagged with a publish counter so a batch keeps
+/// the order things happened in (e.g. "Muxing 100%" before "Organized").
+#[derive(Debug, Default)]
+struct Pending {
+    seq: u64,
+    events: HashMap<(Uuid, u8), (u64, ProgressEvent)>,
 }
 
 impl ProgressHub {
     pub fn publish(&self, event: ProgressEvent) {
-        self.pending.lock().insert(event.key(), event);
+        let mut pending = self.pending.lock();
+        pending.seq += 1;
+        let seq = pending.seq;
+        pending.events.insert(event.key(), (seq, event));
     }
 
-    /// Take everything published since the last drain.
+    /// Take everything published since the last drain, in publish order of each
+    /// event's latest update.
     pub fn drain(&self) -> Vec<ProgressEvent> {
-        let mut map = self.pending.lock();
-        map.drain().map(|(_, v)| v).collect()
+        let mut batch: Vec<_> = self.pending.lock().events.drain().map(|(_, v)| v).collect();
+        batch.sort_unstable_by_key(|(seq, _)| *seq);
+        batch.into_iter().map(|(_, e)| e).collect()
     }
 
     /// Spawn the frame-paced flusher. `sink` is only called with non-empty batches.
@@ -134,6 +147,20 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert!(batch.iter().any(|e| matches!(e, ProgressEvent::Download { bytes_done: 30, .. })));
         assert!(hub.drain().is_empty());
+    }
+
+    #[test]
+    fn drains_in_publish_order() {
+        let hub = ProgressHub::default();
+        let id = Uuid::new_v4();
+        for _ in 0..20 {
+            hub.publish(ProgressEvent::State { task_id: id, state: TaskState::Muxing, message: None });
+            hub.publish(ProgressEvent::Muxing { task_id: id, percent: 100.0, label: "Muxing".into() });
+            hub.publish(ProgressEvent::Organized { task_id: id, destination: "/x.mkv".into() });
+            hub.publish(ProgressEvent::State { task_id: id, state: TaskState::Completed, message: None });
+            let kinds: Vec<u8> = hub.drain().iter().map(|e| e.key().1).collect();
+            assert_eq!(kinds, [1, 3, 2]);
+        }
     }
 
     #[test]

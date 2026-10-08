@@ -162,17 +162,58 @@ fn client_chain(signed_in: bool) -> Vec<&'static InnerTubeClient> {
     if chain.is_empty() { CLIENTS.iter().filter(usable).collect() } else { chain }
 }
 
-/// Try each client in [`CLIENTS`] order and return the first playable result.
 async fn extract_video(ctx: &ExtractContext, source: &Url, id: &str, kind: ContentKind) -> Result<MediaInfo> {
+    let mut info = extract_with_clients(ctx, source, id, kind).await?;
+    // visionOS answers without `microformat`; the organizer files by publish date.
+    if info.published_at.is_none() && info.content_kind != ContentKind::LiveStream {
+        info.published_at = fetch_publish_date(ctx, id).await;
+    }
+    Ok(info)
+}
+
+/// Publish date from the watch page (`<meta itemprop="datePublished">` or the
+/// inline `publishDate`). Best effort: `None` on any failure.
+async fn fetch_publish_date(ctx: &ExtractContext, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let url = Url::parse_with_params("https://www.youtube.com/watch", [("v", id), ("hl", "en")]).ok()?;
+    match ctx.http.get_text(&url, DeviceClass::Desktop).await {
+        Ok(html) => parse_publish_date(&html),
+        Err(e) => {
+            tracing::debug!(error = %e, "youtube publish date fetch failed");
+            None
+        }
+    }
+}
+
+fn parse_publish_date(html: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"itemprop="datePublished" content="([^"]+)"|"publishDate":"([^"]+)""#).expect("valid regex")
+    });
+    RE.captures_iter(html)
+        .filter_map(|c| c.get(1).or_else(|| c.get(2)))
+        .find_map(|m| chrono::DateTime::parse_from_rfc3339(m.as_str()).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// Try each client in the chain and return the first full-tier result, else the
+/// best degraded one (with a warning).
+async fn extract_with_clients(ctx: &ExtractContext, source: &Url, id: &str, kind: ContentKind) -> Result<MediaInfo> {
     let cookie = ctx.cookie_for(Platform::YouTube).filter(|c| sapisid(c).is_some());
     let mut first_err = None;
+    // Best result so far from a client that could not reach the listed top tier.
+    let mut degraded: Option<MediaInfo> = None;
     for client in client_chain(cookie.is_some()) {
         let cookie = cookie.filter(|_| client.cookies != CookieUse::Never);
         let visitor = visitor_data(ctx, cookie).await;
         match extract_with_client(ctx, source, id, kind, client, visitor.as_deref(), cookie).await {
-            Ok(info) if !info.formats.is_empty() => {
+            Ok(info) if !info.formats.is_empty() && info.warnings.is_empty() => {
                 tracing::debug!(client = client.name, formats = info.formats.len(), "youtube client succeeded");
                 return Ok(info);
+            }
+            Ok(info) if !info.formats.is_empty() => {
+                tracing::debug!(client = client.name, warning = ?info.warnings, "youtube client degraded; trying next");
+                if degraded.as_ref().is_none_or(|d| info.max_height() > d.max_height()) {
+                    degraded = Some(info);
+                }
             }
             Ok(_) => tracing::debug!(client = client.name, "youtube client returned no formats"),
             // DRM is a property of the title, not of the client: report it right away.
@@ -183,7 +224,30 @@ async fn extract_video(ctx: &ExtractContext, source: &Url, id: &str, kind: Conte
             }
         }
     }
+    if let Some(info) = degraded {
+        tracing::warn!(warnings = ?info.warnings, "youtube: only a lower tier is downloadable");
+        return Ok(info);
+    }
     Err(first_err.unwrap_or_else(|| CoreError::FormatUnavailable("no downloadable YouTube formats".into())))
+}
+
+/// Tallest video the player response lists, downloadable or not (formats without
+/// a URL are SABR-only or ciphered).
+fn listed_max_height(player: &Value) -> Option<u32> {
+    at(player, "streamingData/adaptiveFormats")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|f| at_u64(f, "height").and_then(|h| u32::try_from(h).ok()))
+        .max()
+}
+
+/// A warning when the downloadable formats stop well below what the video offers.
+fn tier_warning(client: &str, listed: Option<u32>, usable: Option<u32>) -> Option<String> {
+    let listed = listed?;
+    let usable = usable.unwrap_or(0);
+    (usable < listed).then(|| {
+        format!("YouTube lists up to {listed}p for this video, but the {client} client could only get {usable}p")
+    })
 }
 
 async fn extract_with_client(
@@ -199,8 +263,20 @@ async fn extract_with_client(
     let sts = script.as_ref().and_then(|s| s.signature_timestamp);
     let player = fetch_player_response(ctx, id, client, sts, visitor, cookie).await?;
     let mut info = parse_player_response(&player, source, kind)?;
-    if let Some(script) = &script {
-        formats::solve_challenges(&mut info, &player, script).await?;
+    let hls_manifest = at_str(&player, "streamingData/hlsManifestUrl").and_then(|u| Url::parse(u).ok());
+    match hls_manifest {
+        // Live adaptive URLs are per-segment (`sq=`) endpoints, not files: record
+        // the HLS playlists instead.
+        Some(manifest) if info.content_kind == ContentKind::LiveStream => {
+            let master = ctx.http.get_text(&manifest, DeviceClass::Desktop).await?;
+            info.formats = formats::parse_hls_master(&master, &manifest)?;
+        }
+        _ => {
+            if let Some(script) = &script {
+                formats::solve_challenges(&mut info, &player, script).await?;
+            }
+            info.warnings.extend(tier_warning(client.name, listed_max_height(&player), info.max_height()));
+        }
     }
     // googlevideo checks that the downloader looks like the client that asked.
     for f in &mut info.formats {
@@ -396,6 +472,7 @@ pub fn parse_player_response(player: &Value, source: &Url, kind: ContentKind) ->
         content_kind: if is_live { ContentKind::LiveStream } else { kind },
         formats: formats::parse_streaming_data(player),
         subtitles: parse_captions(player),
+        warnings: Vec::new(),
     })
 }
 
@@ -499,6 +576,37 @@ mod tests {
         assert_eq!(names(true), ["VISIONOS", "WEB_EMBEDDED_PLAYER", "TVHTML5", "WEB"]);
         let body = player_request_body("abcdefghijk", &CLIENTS[1], None, None);
         assert_eq!(body["context"]["thirdParty"]["embedUrl"], "https://www.youtube.com/");
+    }
+
+    #[test]
+    fn warns_when_only_a_lower_tier_is_downloadable() {
+        let mut p = sample_player();
+        assert_eq!(listed_max_height(&p), Some(4320));
+        // The 8K formats lose their URLs (SABR-only), 360p stays.
+        for f in p["streamingData"]["adaptiveFormats"].as_array_mut().expect("formats") {
+            if f["itag"] != 251 {
+                f.as_object_mut().expect("obj").remove("url");
+            }
+        }
+        p["streamingData"]["formats"] = json!([{ "itag": 18, "url": "https://rr.googlevideo.com/a?itag=18",
+            "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"", "width": 640, "height": 360 }]);
+        let src = Url::parse("https://youtu.be/abcdefghijk").expect("url");
+        let info = parse_player_response(&p, &src, ContentKind::Video).expect("parsed");
+        let warning = tier_warning("WEB", listed_max_height(&p), info.max_height()).expect("warning");
+        assert_eq!(warning, "YouTube lists up to 4320p for this video, but the WEB client could only get 360p");
+        assert_eq!(tier_warning("VISIONOS", Some(4320), Some(4320)), None);
+        assert_eq!(tier_warning("VISIONOS", None, Some(720)), None);
+    }
+
+    #[test]
+    fn publish_date_from_watch_page() {
+        let html =
+            r#"<meta itemprop="name" content="x"><meta itemprop="datePublished" content="2019-09-01T08:04:14-07:00">"#;
+        assert_eq!(parse_publish_date(html).map(|d| d.to_rfc3339()).as_deref(), Some("2019-09-01T15:04:14+00:00"));
+        let html = r#"{"microformat":{"publishDate":"2024-02-29T00:00:00+00:00"}}"#;
+        assert_eq!(parse_publish_date(html).map(|d| d.date_naive().to_string()).as_deref(), Some("2024-02-29"));
+        assert_eq!(parse_publish_date(r#"itemprop="datePublished" content="2019-09-01""#), None);
+        assert_eq!(parse_publish_date("<html></html>"), None);
     }
 
     #[test]

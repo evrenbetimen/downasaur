@@ -49,6 +49,8 @@ export interface MediaInfo {
   contentKind: ContentKind;
   formats: StreamFormat[];
   subtitles: SubtitleTrack[];
+  /** Caveats to show, e.g. a lower tier than the source offers. */
+  warnings?: string[];
 }
 
 export type Extraction =

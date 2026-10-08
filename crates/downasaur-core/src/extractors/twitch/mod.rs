@@ -110,6 +110,7 @@ impl PlatformExtractor for TwitchExtractor {
             content_kind: kind,
             formats,
             subtitles: Vec::new(),
+            warnings: Vec::new(),
         })))
     }
 }

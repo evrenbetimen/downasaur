@@ -134,6 +134,7 @@ pub fn parse_tweet(tweet: &Value, source: &Url) -> Result<MediaInfo> {
         content_kind: ContentKind::Video,
         formats,
         subtitles: Vec::new(),
+        warnings: Vec::new(),
     })
 }
 

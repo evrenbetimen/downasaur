@@ -138,6 +138,7 @@ pub fn parse_media_item(item: &Value, source: &Url, kind: ContentKind) -> Result
         content_kind: kind,
         formats,
         subtitles: Vec::new(),
+        warnings: Vec::new(),
     })
 }
 

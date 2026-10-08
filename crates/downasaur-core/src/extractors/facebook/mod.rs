@@ -105,6 +105,7 @@ pub fn parse_page(html: &str, source: &Url) -> Result<MediaInfo> {
         content_kind: if is_reel { ContentKind::Short } else { ContentKind::Video },
         formats,
         subtitles: Vec::new(),
+        warnings: Vec::new(),
     })
 }
 
