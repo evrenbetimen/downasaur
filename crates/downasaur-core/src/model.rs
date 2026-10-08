@@ -254,6 +254,10 @@ pub struct MediaInfo {
     pub formats: Vec<StreamFormat>,
     #[serde(default)]
     pub subtitles: Vec<SubtitleTrack>,
+    /// Caveats the user should see, e.g. that only a lower tier than the source
+    /// offers could be fetched.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl MediaInfo {

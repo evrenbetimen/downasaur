@@ -362,7 +362,8 @@ impl Engine {
         };
         let picked = selection::select(&info, &task.profile)?;
 
-        self.set_state(id, TaskState::Downloading, None)?;
+        let warning = (!info.warnings.is_empty()).then(|| info.warnings.join("; "));
+        self.set_state(id, TaskState::Downloading, warning)?;
         let counter = ByteCounter::new(inner.db.load_chunks(id).map(|c| chunks::bytes_done(&c)).unwrap_or(0));
         let reporter = self.spawn_reporter(id, counter.clone(), cancel.child_token());
 

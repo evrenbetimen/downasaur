@@ -46,12 +46,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Extraction::Collection { .. } => return Err("collections are not supported by this example".into()),
     };
     println!(
-        "{} by {:?} ({} formats, probed in {:.1?})",
+        "{} by {:?}, published {} ({} formats, probed in {:.1?})",
         info.title,
         info.author,
+        info.published_at.map_or_else(|| "?".into(), |d| d.date_naive().to_string()),
         info.formats.len(),
         started.elapsed()
     );
+    for w in &info.warnings {
+        println!("warning: {w}");
+    }
     let mut formats = info.formats.clone();
     formats.sort_by_key(|f| std::cmp::Reverse((f.height.unwrap_or(0), f.bitrate.unwrap_or(0))));
     for f in &formats {

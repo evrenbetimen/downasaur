@@ -124,6 +124,7 @@ mod tests {
                 fmt("140", StreamKind::AudioOnly, None, None, 128_000),
             ],
             subtitles: vec![],
+            warnings: Vec::new(),
         }
     }
 

@@ -123,6 +123,7 @@ pub fn parse_info_dict(info: &Value, source: &Url) -> Result<Extraction> {
         },
         formats,
         subtitles,
+        warnings: Vec::new(),
     })))
 }
 
