@@ -1,14 +1,15 @@
 //! Run one URL through the whole engine: extract → download → remux → organize.
 //!
 //! ```text
-//! cargo run --release -p downasaur-core --example fetch -- <url> [output-dir] [--probe]
+//! cargo run --release -p downasaur-core --example fetch -- <url> [output-dir] [--probe] [--cookies=cookies.txt]
 //! ```
 //!
 //! `--probe` only lists the formats. Set `RUST_LOG=downasaur_core=debug` for detail.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use downasaur_core::cookies::PlatformCookies;
 use downasaur_core::engine::{Engine, EngineConfig};
 use downasaur_core::model::{DownloadProfile, Extraction, TaskState};
 use downasaur_core::organizer::OrganizerRules;
@@ -22,11 +23,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let probe_only = args.iter().any(|a| a == "--probe");
+    let cookies = args.iter().find_map(|a| a.strip_prefix("--cookies="));
     let mut positional = args.iter().filter(|a| !a.starts_with("--"));
     let url = positional.next().ok_or("usage: fetch <url> [output-dir] [--probe]")?;
     let out = PathBuf::from(positional.next().map_or("downasaur-out", String::as_str));
 
-    let engine = Engine::new(EngineConfig::with_data_dir(out.join(".downasaur")))?;
+    let mut config = EngineConfig::with_data_dir(out.join(".downasaur"));
+    if let Some(path) = cookies {
+        config.cookies = PlatformCookies::load(Path::new(path))?;
+        println!("cookies loaded for {:?}", config.cookies.platforms().map(|p| p.display_name()).collect::<Vec<_>>());
+    }
+    let engine = Engine::new(config)?;
     engine.set_organizer_rules(OrganizerRules { target_dir: out.clone(), ..Default::default() })?;
 
     let started = Instant::now();

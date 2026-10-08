@@ -26,6 +26,7 @@ use url::Url;
 
 use super::util::{at, at_str, at_u64};
 use super::{ExtractContext, PlatformExtractor, host_is};
+use crate::cookies::header_value;
 use crate::error::{CoreError, DrmScheme, Result};
 use crate::model::{ContentKind, Extraction, MediaInfo, Platform, SubtitleTrack};
 use crate::net::fingerprint::DeviceClass;
@@ -34,8 +35,11 @@ use urls::YouTubeUrl;
 const NAME: &str = "YouTube";
 const PLAYER_ENDPOINT: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
-/// Visitor id shared by every player request of this process; see [`visitor_data`].
-static VISITOR_DATA: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
+const ORIGIN: &str = "https://www.youtube.com";
+
+/// Visitor ids shared by the player requests of this process, anonymous and
+/// signed-in (`[anon, authed]`); see [`visitor_data`].
+static VISITOR_DATA: LazyLock<Mutex<[Option<String>; 2]>> = LazyLock::new(Default::default);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct YouTubeExtractor;
@@ -75,6 +79,20 @@ pub struct InnerTubeClient {
     /// Stream URLs carry `n` (and possibly `signatureCipher`) challenges that need
     /// the player script.
     pub needs_player_js: bool,
+    pub cookies: CookieUse,
+    /// Sends `context.thirdParty.embedUrl`, as an embedded player does.
+    pub embedded: bool,
+}
+
+/// How a client treats imported YouTube cookies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieUse {
+    /// Never sent (the client is anonymous-only).
+    Never,
+    /// Sent when imported; the client also works without.
+    Optional,
+    /// The client is only tried when cookies were imported.
+    Required,
 }
 
 /// visionOS returns adaptive formats with plain URLs and no proof-of-origin token
@@ -93,6 +111,18 @@ pub const CLIENTS: &[InnerTubeClient] = &[
             ("osVersion", "26.5.23O471"),
         ],
         needs_player_js: false,
+        cookies: CookieUse::Never,
+        embedded: false,
+    },
+    InnerTubeClient {
+        name: "WEB_EMBEDDED_PLAYER",
+        id: 56,
+        version: "1.20260708.00.00",
+        user_agent: WEB_USER_AGENT,
+        extra: &[],
+        needs_player_js: true,
+        cookies: CookieUse::Required,
+        embedded: true,
     },
     InnerTubeClient {
         name: "TVHTML5",
@@ -101,24 +131,45 @@ pub const CLIENTS: &[InnerTubeClient] = &[
         user_agent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
         extra: &[],
         needs_player_js: true,
+        cookies: CookieUse::Optional,
+        embedded: false,
+    },
+    InnerTubeClient {
+        name: "WEB",
+        id: 1,
+        version: "2.20261007.01.00",
+        user_agent: WEB_USER_AGENT,
+        extra: &[],
+        needs_player_js: true,
+        cookies: CookieUse::Required,
+        embedded: false,
     },
 ];
 
-/// Clients to try, in order. `DOWNASAUR_YT_CLIENTS=TVHTML5` narrows and
-/// reorders [`CLIENTS`] (for debugging a single client).
-fn client_chain() -> Vec<&'static InnerTubeClient> {
+const WEB_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+
+/// Clients to try, in order; [`CookieUse::Required`] clients only when signed in.
+/// `DOWNASAUR_YT_CLIENTS=TVHTML5` narrows and reorders the chain (for debugging
+/// a single client).
+fn client_chain(signed_in: bool) -> Vec<&'static InnerTubeClient> {
+    let usable = |c: &&InnerTubeClient| signed_in || c.cookies != CookieUse::Required;
     let only = std::env::var("DOWNASAUR_YT_CLIENTS").unwrap_or_default();
-    let chain: Vec<_> =
-        only.split(',').filter_map(|n| CLIENTS.iter().find(|c| c.name.eq_ignore_ascii_case(n.trim()))).collect();
-    if chain.is_empty() { CLIENTS.iter().collect() } else { chain }
+    let chain: Vec<_> = only
+        .split(',')
+        .filter_map(|n| CLIENTS.iter().find(|c| c.name.eq_ignore_ascii_case(n.trim())))
+        .filter(usable)
+        .collect();
+    if chain.is_empty() { CLIENTS.iter().filter(usable).collect() } else { chain }
 }
 
 /// Try each client in [`CLIENTS`] order and return the first playable result.
 async fn extract_video(ctx: &ExtractContext, source: &Url, id: &str, kind: ContentKind) -> Result<MediaInfo> {
-    let visitor = visitor_data(ctx).await;
+    let cookie = ctx.cookie_for(Platform::YouTube).filter(|c| sapisid(c).is_some());
     let mut first_err = None;
-    for client in client_chain() {
-        match extract_with_client(ctx, source, id, kind, client, visitor.as_deref()).await {
+    for client in client_chain(cookie.is_some()) {
+        let cookie = cookie.filter(|_| client.cookies != CookieUse::Never);
+        let visitor = visitor_data(ctx, cookie).await;
+        match extract_with_client(ctx, source, id, kind, client, visitor.as_deref(), cookie).await {
             Ok(info) if !info.formats.is_empty() => {
                 tracing::debug!(client = client.name, formats = info.formats.len(), "youtube client succeeded");
                 return Ok(info);
@@ -142,10 +193,11 @@ async fn extract_with_client(
     kind: ContentKind,
     client: &InnerTubeClient,
     visitor: Option<&str>,
+    cookie: Option<&str>,
 ) -> Result<MediaInfo> {
     let script = if client.needs_player_js { Some(jsc::PlayerScript::load(&ctx.http).await?) } else { None };
     let sts = script.as_ref().and_then(|s| s.signature_timestamp);
-    let player = fetch_player_response(ctx, id, client, sts, visitor).await?;
+    let player = fetch_player_response(ctx, id, client, sts, visitor, cookie).await?;
     let mut info = parse_player_response(&player, source, kind)?;
     if let Some(script) = &script {
         formats::solve_challenges(&mut info, &player, script).await?;
@@ -159,13 +211,29 @@ async fn extract_with_client(
 
 /// A visitor id (`VISITOR_DATA` from the homepage's `ytcfg`). Anonymous player
 /// requests without one are answered with "Sign in to confirm you're not a bot",
-/// even from residential IPs. Fetched once per process; `None` if the page changed.
-async fn visitor_data(ctx: &ExtractContext) -> Option<String> {
-    if let Some(v) = VISITOR_DATA.lock().clone() {
+/// even from residential IPs. Signed-in requests use the id of their own session.
+/// Fetched once per process and kind; `None` if the page changed.
+async fn visitor_data(ctx: &ExtractContext, cookie: Option<&str>) -> Option<String> {
+    let slot = usize::from(cookie.is_some());
+    if let Some(v) = VISITOR_DATA.lock()[slot].clone() {
         return Some(v);
     }
     let home = Url::parse("https://www.youtube.com/").ok()?;
-    let html = match ctx.http.get_text(&home, DeviceClass::Desktop).await {
+    let fetched = ctx
+        .http
+        .send_with_retry(|pool| {
+            let req = pool.get(&home, DeviceClass::Desktop);
+            match cookie {
+                Some(c) => req.header("Cookie", c),
+                None => req,
+            }
+        })
+        .await;
+    let html = match fetched {
+        Ok(resp) => resp.text().await.map_err(CoreError::from),
+        Err(e) => Err(e),
+    };
+    let html = match html {
         Ok(html) => html,
         Err(e) => {
             tracing::debug!(error = %e, "youtube visitor data fetch failed");
@@ -176,8 +244,32 @@ async fn visitor_data(ctx: &ExtractContext) -> Option<String> {
     if visitor.is_none() {
         tracing::debug!("youtube homepage carried no VISITOR_DATA");
     }
-    VISITOR_DATA.lock().clone_from(&visitor);
+    VISITOR_DATA.lock()[slot].clone_from(&visitor);
     visitor
+}
+
+/// The `SAPISID` session cookie (or its `__Secure-3PAPISID` twin) that signs
+/// authenticated InnerTube requests.
+fn sapisid(cookie: &str) -> Option<&str> {
+    header_value(cookie, "SAPISID").or_else(|| header_value(cookie, "__Secure-3PAPISID"))
+}
+
+/// `Authorization` value for a signed-in request, as the web client computes it:
+/// `<scheme> <ts>_<sha1("<ts> <sid> <origin>")>` for each session id present.
+fn sapisid_authorization(cookie: &str, origin: &str, now: i64) -> Option<String> {
+    let schemes = [
+        ("SAPISIDHASH", sapisid(cookie)),
+        ("SAPISID1PHASH", header_value(cookie, "__Secure-1PAPISID")),
+        ("SAPISID3PHASH", header_value(cookie, "__Secure-3PAPISID")),
+    ];
+    let parts: Vec<String> = schemes
+        .iter()
+        .filter_map(|(scheme, sid)| {
+            let digest = sha1_smol::Sha1::from(format!("{now} {} {origin}", (*sid)?)).digest().to_string();
+            Some(format!("{scheme} {now}_{digest}"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn parse_visitor_data(html: &str) -> Option<String> {
@@ -192,6 +284,7 @@ async fn fetch_player_response(
     client: &InnerTubeClient,
     signature_timestamp: Option<u64>,
     visitor: Option<&str>,
+    cookie: Option<&str>,
 ) -> Result<Value> {
     let endpoint = Url::parse(PLAYER_ENDPOINT)?;
     let body = player_request_body(video_id, client, signature_timestamp, visitor);
@@ -205,9 +298,19 @@ async fn fetch_player_response(
                 .header("User-Agent", client.user_agent)
                 .header("X-YouTube-Client-Name", client.id.to_string())
                 .header("X-YouTube-Client-Version", client.version)
-                .header("Origin", "https://www.youtube.com");
-            match visitor {
+                .header("Origin", ORIGIN);
+            let req = match visitor {
                 Some(v) => req.header("X-Goog-Visitor-Id", v),
+                None => req,
+            };
+            // Signed again on every attempt: the hash embeds the current time.
+            match cookie.and_then(|c| Some((c, sapisid_authorization(c, ORIGIN, chrono::Utc::now().timestamp())?))) {
+                Some((c, auth)) => req
+                    .header("Cookie", c)
+                    .header("Authorization", auth)
+                    .header("X-Origin", ORIGIN)
+                    .header("X-Goog-AuthUser", "0")
+                    .header("X-Youtube-Bootstrap-Logged-In", "true"),
                 None => req,
             }
         })
@@ -228,13 +331,17 @@ fn player_request_body(
     if let Some(v) = visitor {
         client_ctx["visitorData"] = json!(v);
     }
+    let mut context = json!({ "client": client_ctx });
+    if client.embedded {
+        context["thirdParty"] = json!({ "embedUrl": format!("{ORIGIN}/") });
+    }
     let mut playback = json!({ "html5Preference": "HTML5_PREF_WANTS" });
     if let Some(sts) = signature_timestamp {
         playback["signatureTimestamp"] = json!(sts);
     }
     json!({
         "videoId": video_id,
-        "context": { "client": client_ctx },
+        "context": context,
         "playbackContext": { "contentPlaybackContext": playback },
         "contentCheckOk": true,
         "racyCheckOk": true
@@ -363,9 +470,35 @@ mod tests {
         assert_eq!(body["context"]["client"]["deviceModel"], "RealityDevice17,1");
         assert_eq!(body["context"]["client"]["visitorData"], "CgtWaXNpdG9y");
         assert!(body["playbackContext"]["contentPlaybackContext"].get("signatureTimestamp").is_none());
-        let body = player_request_body("abcdefghijk", &CLIENTS[1], Some(20367), None);
+        let body = player_request_body("abcdefghijk", &CLIENTS[2], Some(20367), None);
         assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20367);
         assert!(body["context"]["client"].get("visitorData").is_none());
+    }
+
+    #[test]
+    fn sapisid_hash_matches_web_client() {
+        let cookie = "PREF=x; SAPISID=abc/def; __Secure-1PAPISID=one; __Secure-3PAPISID=three";
+        assert_eq!(
+            sapisid_authorization(cookie, ORIGIN, 1_700_000_000).as_deref(),
+            Some(
+                "SAPISIDHASH 1700000000_747622f274182ecf105054645d6a0093199ab03d \
+                 SAPISID1PHASH 1700000000_01ca8712a198105a3f0999f890c24137388b7fff \
+                 SAPISID3PHASH 1700000000_7f5cf0ef7325a890a89cc0dc432ce24c7bae42dc"
+            )
+        );
+        // __Secure-3PAPISID stands in for a missing SAPISID.
+        let auth = sapisid_authorization("__Secure-3PAPISID=three", ORIGIN, 1_700_000_000).expect("auth");
+        assert!(auth.starts_with("SAPISIDHASH 1700000000_7f5cf0ef"), "{auth}");
+        assert_eq!(sapisid_authorization("PREF=x", ORIGIN, 1_700_000_000), None);
+    }
+
+    #[test]
+    fn signed_out_chain_skips_cookie_only_clients() {
+        let names = |signed_in| client_chain(signed_in).iter().map(|c| c.name).collect::<Vec<_>>();
+        assert_eq!(names(false), ["VISIONOS", "TVHTML5"]);
+        assert_eq!(names(true), ["VISIONOS", "WEB_EMBEDDED_PLAYER", "TVHTML5", "WEB"]);
+        let body = player_request_body("abcdefghijk", &CLIENTS[1], None, None);
+        assert_eq!(body["context"]["thirdParty"]["embedUrl"], "https://www.youtube.com/");
     }
 
     #[test]
