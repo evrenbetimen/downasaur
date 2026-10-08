@@ -27,6 +27,21 @@ const NAME: &str = "YouTube";
 const LIB_JS: &str = include_str!("../../../vendor/yt-dlp-ejs/lib.min.js");
 const CORE_JS: &str = include_str!("../../../vendor/yt-dlp-ejs/core.min.js");
 
+/// Browser behaviour QuickJS lacks. Players since `f2999a12` stringify an array
+/// that contains itself: V8 renders the cycle as `""`, while QuickJS recurses in
+/// native code until the thread's stack is gone (the JS stack limit never fires).
+const PRELUDE_JS: &str = r#"(() => {
+  const join = Array.prototype.join, active = new Set();
+  Object.defineProperty(Array.prototype, "join", {
+    writable: true, configurable: true,
+    value: function (sep) {
+      if (active.has(this)) return "";
+      active.add(this);
+      try { return join.call(this, sep); } finally { active.delete(this); }
+    },
+  });
+})();"#;
+
 /// QuickJS keeps its parser recursion on the native stack; the player AST is deep.
 const THREAD_STACK: usize = 64 * 1024 * 1024;
 const JS_MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
@@ -110,7 +125,7 @@ pub fn solve_blocking(
         globals.set("__player", player).map_err(|e| js_err("input", e.to_string()))?;
         globals.set("__requests", requests.as_str()).map_err(|e| js_err("input", e.to_string()))?;
         let script = format!(
-            "{LIB_JS}\n;Object.assign(globalThis, lib);\n{CORE_JS}\n;\
+            "{PRELUDE_JS}\n{LIB_JS}\n;Object.assign(globalThis, lib);\n{CORE_JS}\n;\
              JSON.stringify(jsc({{type: {input_kind:?}, player: __player, preprocessed_player: __player, \
              output_preprocessed: {output}, requests: JSON.parse(__requests)}}));",
             output = preprocessed.is_none(),
@@ -165,6 +180,7 @@ impl PlayerScript {
                 js
             }
         };
+        tracing::debug!(player = %id, bytes = js.len(), "youtube player script loaded");
         Ok(Self { signature_timestamp: signature_timestamp(&js), id, js })
     }
 
@@ -219,6 +235,22 @@ mod tests {
         let src = "var _yt_player={};(function(g){var window=this;var a=1;})(_yt_player);";
         let err = solve_blocking(src, None, &["abc".into()], &[]).expect_err("no n function");
         assert!(err.to_string().contains("challenge solver"), "{err}");
+    }
+
+    /// A self-referencing array must stringify like V8 (`""` for the cycle)
+    /// instead of overflowing the native stack.
+    #[test]
+    fn cyclic_array_join_terminates() {
+        let src = "var _yt_player={};(function(g){var window=this;})(_yt_player);";
+        let rt = Runtime::new().expect("rt");
+        let ctx = Context::full(&rt).expect("ctx");
+        let out: String = ctx.with(|ctx| {
+            ctx.eval::<(), _>(PRELUDE_JS).expect("prelude");
+            ctx.eval("var a = [1, 2]; a.push(a); String(a) + '|' + [a, [3]].join('-')").expect("eval")
+        });
+        assert_eq!(out, "1,2,|1,2,-3");
+        // The solver still reports missing functions cleanly with the prelude in place.
+        assert!(solve_blocking(src, None, &["abc".into()], &[]).is_err());
     }
 
     /// Solves real challenges against a downloaded player script.
