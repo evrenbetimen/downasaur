@@ -19,6 +19,7 @@
 //! Progress from every stage flows through [`progress::ProgressHub`], which
 //! coalesces updates to at most one frame every ~16 ms (60 fps) per sink.
 
+pub mod cookies;
 pub mod db;
 pub mod downloader;
 pub mod drm;

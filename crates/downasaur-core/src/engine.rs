@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+use crate::cookies::PlatformCookies;
 use crate::db::Database;
 use crate::downloader::hls::HlsJob;
 use crate::downloader::http::HttpJob;
@@ -50,6 +51,8 @@ pub struct EngineConfig {
     pub http: HttpConfig,
     pub ffmpeg: PathBuf,
     pub yt_dlp: PathBuf,
+    /// Cookies the user imported (see [`crate::cookies`]); empty by default.
+    pub cookies: PlatformCookies,
 }
 
 impl EngineConfig {
@@ -62,6 +65,7 @@ impl EngineConfig {
             http: HttpConfig::default(),
             ffmpeg: PathBuf::from("ffmpeg"),
             yt_dlp: PathBuf::from("yt-dlp"),
+            cookies: PlatformCookies::default(),
         }
     }
 }
@@ -115,6 +119,7 @@ impl Engine {
         let http = HttpPool::new(config.http.clone())?;
         let mut ctx = ExtractContext::new(http);
         ctx.yt_dlp = config.yt_dlp.clone();
+        ctx.cookies = config.cookies.clone();
 
         let scheduler: SchedulerConfig = db.get_setting(keys::SCHEDULER)?.unwrap_or_default();
         Ok(Self {

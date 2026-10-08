@@ -13,13 +13,13 @@ pub mod twitter;
 pub mod util;
 pub mod youtube;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use url::Url;
 
+use crate::cookies::PlatformCookies;
 use crate::error::{CoreError, Result};
 use crate::model::{Extraction, Platform};
 use crate::net::HttpPool;
@@ -30,18 +30,18 @@ pub struct ExtractContext {
     pub http: HttpPool,
     /// Per-platform `Cookie` header values imported by the user (e.g. to access
     /// their own Instagram stories). Never required for public content.
-    pub cookies: HashMap<Platform, String>,
+    pub cookies: PlatformCookies,
     /// Path to the `yt-dlp` executable used by the universal fallback.
     pub yt_dlp: PathBuf,
 }
 
 impl ExtractContext {
     pub fn new(http: HttpPool) -> Self {
-        Self { http, cookies: HashMap::new(), yt_dlp: PathBuf::from("yt-dlp") }
+        Self { http, cookies: PlatformCookies::default(), yt_dlp: PathBuf::from("yt-dlp") }
     }
 
     pub fn cookie_for(&self, platform: Platform) -> Option<&str> {
-        self.cookies.get(&platform).map(String::as_str)
+        self.cookies.get(platform)
     }
 }
 
