@@ -16,7 +16,11 @@ pub mod jsc;
 pub mod playlist;
 pub mod urls;
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
+use parking_lot::Mutex;
+use regex::Regex;
 use serde_json::{Value, json};
 use url::Url;
 
@@ -24,10 +28,14 @@ use super::util::{at, at_str, at_u64};
 use super::{ExtractContext, PlatformExtractor, host_is};
 use crate::error::{CoreError, DrmScheme, Result};
 use crate::model::{ContentKind, Extraction, MediaInfo, Platform, SubtitleTrack};
+use crate::net::fingerprint::DeviceClass;
 use urls::YouTubeUrl;
 
 const NAME: &str = "YouTube";
 const PLAYER_ENDPOINT: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+/// Visitor id shared by every player request of this process; see [`visitor_data`].
+static VISITOR_DATA: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct YouTubeExtractor;
@@ -98,9 +106,10 @@ pub const CLIENTS: &[InnerTubeClient] = &[
 
 /// Try each client in [`CLIENTS`] order and return the first playable result.
 async fn extract_video(ctx: &ExtractContext, source: &Url, id: &str, kind: ContentKind) -> Result<MediaInfo> {
+    let visitor = visitor_data(ctx).await;
     let mut first_err = None;
     for client in CLIENTS {
-        match extract_with_client(ctx, source, id, kind, client).await {
+        match extract_with_client(ctx, source, id, kind, client, visitor.as_deref()).await {
             Ok(info) if !info.formats.is_empty() => {
                 tracing::debug!(client = client.name, formats = info.formats.len(), "youtube client succeeded");
                 return Ok(info);
@@ -123,10 +132,11 @@ async fn extract_with_client(
     id: &str,
     kind: ContentKind,
     client: &InnerTubeClient,
+    visitor: Option<&str>,
 ) -> Result<MediaInfo> {
     let script = if client.needs_player_js { Some(jsc::PlayerScript::load(&ctx.http).await?) } else { None };
     let sts = script.as_ref().and_then(|s| s.signature_timestamp);
-    let player = fetch_player_response(ctx, id, client, sts).await?;
+    let player = fetch_player_response(ctx, id, client, sts, visitor).await?;
     let mut info = parse_player_response(&player, source, kind)?;
     if let Some(script) = &script {
         formats::solve_challenges(&mut info, &player, script).await?;
@@ -138,34 +148,76 @@ async fn extract_with_client(
     Ok(info)
 }
 
+/// A visitor id (`VISITOR_DATA` from the homepage's `ytcfg`). Anonymous player
+/// requests without one are answered with "Sign in to confirm you're not a bot",
+/// even from residential IPs. Fetched once per process; `None` if the page changed.
+async fn visitor_data(ctx: &ExtractContext) -> Option<String> {
+    if let Some(v) = VISITOR_DATA.lock().clone() {
+        return Some(v);
+    }
+    let home = Url::parse("https://www.youtube.com/").ok()?;
+    let html = match ctx.http.get_text(&home, DeviceClass::Desktop).await {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::debug!(error = %e, "youtube visitor data fetch failed");
+            return None;
+        }
+    };
+    let visitor = parse_visitor_data(&html);
+    if visitor.is_none() {
+        tracing::debug!("youtube homepage carried no VISITOR_DATA");
+    }
+    VISITOR_DATA.lock().clone_from(&visitor);
+    visitor
+}
+
+fn parse_visitor_data(html: &str) -> Option<String> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""VISITOR_DATA":"([^"]+)""#).expect("valid regex"));
+    RE.captures(html).map(|c| c[1].to_owned())
+}
+
 /// Query the InnerTube player endpoint for a video's `playerResponse`.
 async fn fetch_player_response(
     ctx: &ExtractContext,
     video_id: &str,
     client: &InnerTubeClient,
     signature_timestamp: Option<u64>,
+    visitor: Option<&str>,
 ) -> Result<Value> {
     let endpoint = Url::parse(PLAYER_ENDPOINT)?;
-    let body = player_request_body(video_id, client, signature_timestamp);
+    let body = player_request_body(video_id, client, signature_timestamp, visitor);
     let resp = ctx
         .http
         .send_with_retry(|pool| {
-            pool.client()
+            let req = pool
+                .client()
                 .post(endpoint.clone())
                 .json(&body)
                 .header("User-Agent", client.user_agent)
                 .header("X-YouTube-Client-Name", client.id.to_string())
                 .header("X-YouTube-Client-Version", client.version)
-                .header("Origin", "https://www.youtube.com")
+                .header("Origin", "https://www.youtube.com");
+            match visitor {
+                Some(v) => req.header("X-Goog-Visitor-Id", v),
+                None => req,
+            }
         })
         .await?;
     Ok(resp.json().await?)
 }
 
-fn player_request_body(video_id: &str, client: &InnerTubeClient, signature_timestamp: Option<u64>) -> Value {
+fn player_request_body(
+    video_id: &str,
+    client: &InnerTubeClient,
+    signature_timestamp: Option<u64>,
+    visitor: Option<&str>,
+) -> Value {
     let mut client_ctx = json!({ "clientName": client.name, "clientVersion": client.version, "hl": "en", "userAgent": client.user_agent });
     for (k, v) in client.extra {
         client_ctx[*k] = json!(v);
+    }
+    if let Some(v) = visitor {
+        client_ctx["visitorData"] = json!(v);
     }
     let mut playback = json!({ "html5Preference": "HTML5_PREF_WANTS" });
     if let Some(sts) = signature_timestamp {
@@ -297,12 +349,21 @@ mod tests {
 
     #[test]
     fn request_body_carries_client_identity() {
-        let body = player_request_body("abcdefghijk", &CLIENTS[0], None);
+        let body = player_request_body("abcdefghijk", &CLIENTS[0], None, Some("CgtWaXNpdG9y"));
         assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
         assert_eq!(body["context"]["client"]["deviceModel"], "RealityDevice17,1");
+        assert_eq!(body["context"]["client"]["visitorData"], "CgtWaXNpdG9y");
         assert!(body["playbackContext"]["contentPlaybackContext"].get("signatureTimestamp").is_none());
-        let body = player_request_body("abcdefghijk", &CLIENTS[1], Some(20367));
+        let body = player_request_body("abcdefghijk", &CLIENTS[1], Some(20367), None);
         assert_eq!(body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"], 20367);
+        assert!(body["context"]["client"].get("visitorData").is_none());
+    }
+
+    #[test]
+    fn visitor_data_is_read_from_ytcfg() {
+        let html = r#"<script>ytcfg.set({"INNERTUBE_API_KEY":"x","VISITOR_DATA":"CgtLeDdPd2Z0TzEtVSjX75vWBg%3D%3D","HL":"en"});</script>"#;
+        assert_eq!(parse_visitor_data(html).as_deref(), Some("CgtLeDdPd2Z0TzEtVSjX75vWBg%3D%3D"));
+        assert_eq!(parse_visitor_data("<html></html>"), None);
     }
 
     #[test]
