@@ -44,6 +44,7 @@ fastrand = "2"
 parking_lot = "0.12"
 unicode-normalization = "0.1"
 deunicode = "1.6"
+rquickjs = "0.14"
 
 # Tauri (v2)
 tauri = { version = "2.12", features = [] }

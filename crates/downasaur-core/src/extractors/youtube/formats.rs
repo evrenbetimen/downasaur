@@ -3,12 +3,11 @@
 use serde_json::Value;
 use url::Url;
 
-use super::cipher::{self, CipherProgram};
+use super::cipher::SignatureCipher;
+use super::jsc::PlayerScript;
 use crate::error::{CoreError, Result};
-use crate::extractors::ExtractContext;
-use crate::extractors::util::{at, at_str, at_u64, json_string_field};
+use crate::extractors::util::{at, at_str, at_u64};
 use crate::model::{AudioCodec, MediaInfo, StreamFormat, StreamKind, Transport, VideoCodec};
-use crate::net::fingerprint::DeviceClass;
 
 /// Parse `mimeType` like `video/webm; codecs="vp09.00.51.08"` into (major, container, codecs).
 fn split_mime(mime: &str) -> (&str, &str, &str) {
@@ -61,7 +60,7 @@ fn all_formats(player: &Value) -> impl Iterator<Item = &Value> {
 }
 
 /// Map every format that has a direct URL. Ciphered formats are added later by
-/// [`resolve_ciphers`].
+/// [`solve_challenges`].
 pub fn parse_streaming_data(player: &Value) -> Vec<StreamFormat> {
     all_formats(player)
         .filter_map(|f| {
@@ -71,34 +70,60 @@ pub fn parse_streaming_data(player: &Value) -> Vec<StreamFormat> {
         .collect()
 }
 
-/// Decipher `signatureCipher` formats using the transform program from the
-/// current player script and append them to `info.formats`.
-pub async fn resolve_ciphers(ctx: &ExtractContext, info: &mut MediaInfo, player: &Value) -> Result<()> {
-    let ciphered: Vec<&Value> = all_formats(player).filter(|f| f.get("signatureCipher").is_some()).collect();
-    if ciphered.is_empty() {
-        return Ok(());
-    }
+/// Rewrite every format for a JS-dependent client: decipher `signatureCipher`
+/// formats and replace each URL's `n` parameter with the player's transform of it.
+///
+/// Without the `n` rewrite googlevideo throttles the transfer to about real-time
+/// speed, which makes 8K downloads take longer than the video itself.
+pub async fn solve_challenges(info: &mut MediaInfo, player: &Value, script: &PlayerScript) -> Result<()> {
+    let ciphered: Vec<(&Value, SignatureCipher)> = all_formats(player)
+        .filter_map(|f| Some((f, SignatureCipher::parse(at_str(f, "signatureCipher")?))))
+        .map(|(f, c)| c.map(|c| (f, c)))
+        .collect::<Result<_>>()?;
 
-    let program = load_cipher_program(ctx, &info.id).await?;
-    for f in ciphered {
-        let Some(raw) = at_str(f, "signatureCipher") else { continue };
-        let parts = cipher::SignatureCipher::parse(raw)?;
-        let url = parts.resolve(&program)?;
-        if let Some(fmt) = map_format(f, url) {
+    let mut n_values: Vec<String> = info
+        .formats
+        .iter()
+        .map(|f| &f.url)
+        .chain(ciphered.iter().map(|(_, c)| &c.url))
+        .filter_map(|u| query_value(u, "n"))
+        .collect();
+    n_values.sort();
+    n_values.dedup();
+    let sig_values: Vec<String> = ciphered.iter().map(|(_, c)| c.s.clone()).collect();
+
+    let solved = script.solve(n_values, sig_values).await?;
+
+    for (f, c) in &ciphered {
+        let sig = solved.sig.get(&c.s).ok_or_else(|| CoreError::extraction("YouTube", "signature not solved"))?;
+        if let Some(fmt) = map_format(f, c.resolve(sig)) {
             info.formats.push(fmt);
+        }
+    }
+    for fmt in &mut info.formats {
+        if let Some(n) = query_value(&fmt.url, "n") {
+            let solved_n =
+                solved.n.get(&n).ok_or_else(|| CoreError::extraction("YouTube", "n parameter not solved"))?;
+            set_query_value(&mut fmt.url, "n", solved_n);
         }
     }
     Ok(())
 }
 
-async fn load_cipher_program(ctx: &ExtractContext, video_id: &str) -> Result<CipherProgram> {
-    let embed = Url::parse(&format!("https://www.youtube.com/embed/{video_id}"))?;
-    let html = ctx.http.get_text(&embed, DeviceClass::Desktop).await?;
-    let js_path = json_string_field(&html, "jsUrl")
-        .ok_or_else(|| CoreError::extraction("YouTube", "player script URL not found"))?;
-    let js_url = Url::parse("https://www.youtube.com")?.join(&js_path)?;
-    let js = ctx.http.get_text(&js_url, DeviceClass::Desktop).await?;
-    CipherProgram::from_player_js(&js)
+fn query_value(url: &Url, key: &str) -> Option<String> {
+    url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
+}
+
+/// Replace `key`'s value in place, keeping parameter order.
+fn set_query_value(url: &mut Url, key: &str, value: &str) {
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| {
+            let v = if k == key { value.to_owned() } else { v.into_owned() };
+            (k.into_owned(), v)
+        })
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(pairs);
 }
 
 #[cfg(test)]
@@ -112,5 +137,13 @@ mod tests {
             split_mime(r#"video/mp4; codecs="avc1.42001E, mp4a.40.2""#),
             ("video", "mp4", "avc1.42001E, mp4a.40.2")
         );
+    }
+
+    #[test]
+    fn replaces_n_in_place() {
+        let mut u = Url::parse("https://rr.googlevideo.com/videoplayback?itag=571&n=abc&sig=x%2By").expect("url");
+        assert_eq!(query_value(&u, "n").as_deref(), Some("abc"));
+        set_query_value(&mut u, "n", "xyz");
+        assert_eq!(u.as_str(), "https://rr.googlevideo.com/videoplayback?itag=571&n=xyz&sig=x%2By");
     }
 }
