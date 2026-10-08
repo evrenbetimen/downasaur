@@ -28,6 +28,9 @@ pub struct DownloadOptions {
     pub buffer_capacity: usize,
     /// Persist chunk progress at most this often (bytes) to keep SQLite writes cheap.
     pub checkpoint_every: u64,
+    /// Stop recording a live stream after this much media and finish the task
+    /// normally (remux + organize). `None` records until the stream ends.
+    pub live_max_duration: Option<std::time::Duration>,
 }
 
 impl Default for DownloadOptions {
@@ -37,6 +40,7 @@ impl Default for DownloadOptions {
             connections: 8,
             buffer_capacity: 8 * 1024 * 1024,
             checkpoint_every: 4 * 1024 * 1024,
+            live_max_duration: None,
         }
     }
 }

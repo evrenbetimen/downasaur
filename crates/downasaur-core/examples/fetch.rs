@@ -1,10 +1,11 @@
 //! Run one URL through the whole engine: extract → download → remux → organize.
 //!
 //! ```text
-//! cargo run --release -p downasaur-core --example fetch -- <url> [output-dir] [--probe] [--cookies=cookies.txt]
+//! cargo run --release -p downasaur-core --example fetch -- <url> [output-dir] [--probe] [--cookies=cookies.txt] [--live-secs=60]
 //! ```
 //!
-//! `--probe` only lists the formats. Set `RUST_LOG=downasaur_core=debug` for detail.
+//! `--probe` only lists the formats; `--live-secs` stops a live recording after
+//! that many seconds of media. Set `RUST_LOG=downasaur_core=debug` for detail.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -24,11 +25,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let probe_only = args.iter().any(|a| a == "--probe");
     let cookies = args.iter().find_map(|a| a.strip_prefix("--cookies="));
+    let live_secs: Option<u64> =
+        args.iter().find_map(|a| a.strip_prefix("--live-secs=")).map(str::parse).transpose()?;
     let mut positional = args.iter().filter(|a| !a.starts_with("--"));
     let url = positional.next().ok_or("usage: fetch <url> [output-dir] [--probe]")?;
     let out = PathBuf::from(positional.next().map_or("downasaur-out", String::as_str));
 
     let mut config = EngineConfig::with_data_dir(out.join(".downasaur"));
+    config.download.live_max_duration = live_secs.map(Duration::from_secs);
     if let Some(path) = cookies {
         config.cookies = PlatformCookies::load(Path::new(path))?;
         println!("cookies loaded for {:?}", config.cookies.platforms().map(|p| p.display_name()).collect::<Vec<_>>());
@@ -76,14 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if last_print.elapsed() > Duration::from_secs(2) =>
                 {
                     last_print = Instant::now();
-                    let total = bytes_total.unwrap_or(0).max(1);
-                    println!(
-                        "  {:.1}% {:.0}/{:.0} MB @ {:.1} MB/s",
-                        bytes_done as f64 * 100.0 / total as f64,
-                        bytes_done as f64 / 1e6,
-                        total as f64 / 1e6,
-                        speed_bps / 1e6
-                    );
+                    match bytes_total {
+                        Some(total) => println!(
+                            "  {:.1}% {:.0}/{:.0} MB @ {:.1} MB/s",
+                            bytes_done as f64 * 100.0 / total.max(1) as f64,
+                            bytes_done as f64 / 1e6,
+                            total as f64 / 1e6,
+                            speed_bps / 1e6
+                        ),
+                        // Live recordings have no known size.
+                        None => println!("  {:.1} MB @ {:.1} MB/s", bytes_done as f64 / 1e6, speed_bps / 1e6),
+                    }
                 }
                 ProgressEvent::Muxing { percent, label, .. } => println!("  {label} {percent:.0}%"),
                 ProgressEvent::State { state, message, .. } => {

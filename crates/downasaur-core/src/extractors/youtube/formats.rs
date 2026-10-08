@@ -9,6 +9,83 @@ use crate::error::{CoreError, Result};
 use crate::extractors::util::{at, at_str, at_u64};
 use crate::model::{AudioCodec, MediaInfo, StreamFormat, StreamKind, Transport, VideoCodec};
 
+/// Live HLS audio renditions name their group after the itag.
+fn hls_audio_bitrate(group: &str) -> Option<u64> {
+    match group {
+        "233" => Some(48_000),
+        "234" => Some(128_000),
+        _ => None,
+    }
+}
+
+/// Formats of a live stream's HLS master playlist (`hlsManifestUrl`).
+///
+/// Video variants that reference an `AUDIO` group carry no sound of their own,
+/// so they become [`StreamKind::VideoOnly`] and each audio rendition becomes an
+/// [`StreamKind::AudioOnly`] format; the remux stage joins the two recordings.
+pub fn parse_hls_master(text: &str, base: &Url) -> Result<Vec<StreamFormat>> {
+    let master = m3u8_rs::parse_master_playlist_res(text.as_bytes())
+        .map_err(|e| CoreError::Parse(format!("invalid HLS master playlist: {e}")))?;
+    let hls = |id: String, url: Url, kind| StreamFormat {
+        id,
+        url,
+        kind,
+        transport: Transport::Hls { live: true },
+        container: "ts".into(),
+        width: None,
+        height: None,
+        fps: None,
+        video_codec: None,
+        audio_codec: None,
+        bitrate: None,
+        hdr: false,
+        headers: Vec::new(),
+    };
+
+    let mut formats: Vec<StreamFormat> = master
+        .variants
+        .iter()
+        .filter(|v| !v.is_i_frame)
+        .filter_map(|v| {
+            let url = base.join(&v.uri).ok()?;
+            let codecs: Vec<&str> = v.codecs.as_deref().unwrap_or("").split(',').map(str::trim).collect();
+            let video = codecs.iter().find(|c| !c.starts_with("mp4a") && !c.starts_with("opus"))?;
+            let height = v.resolution.and_then(|r| u32::try_from(r.height).ok());
+            let kind = if v.audio.is_some() { StreamKind::VideoOnly } else { StreamKind::Muxed };
+            let mut f = hls(format!("hls-{}p", height.unwrap_or(0)), url, kind);
+            f.width = v.resolution.and_then(|r| u32::try_from(r.width).ok());
+            f.height = height;
+            f.fps = v.frame_rate.map(|r| r as f32);
+            f.video_codec = Some(VideoCodec::from_codecs_attr(video));
+            f.audio_codec = (kind == StreamKind::Muxed)
+                .then(|| codecs.iter().find(|c| c.starts_with("mp4a") || c.starts_with("opus")))
+                .flatten()
+                .map(|c| AudioCodec::from_codecs_attr(c));
+            f.bitrate = v.average_bandwidth.or(Some(v.bandwidth));
+            Some(f)
+        })
+        .collect();
+
+    for alt in master.alternatives.iter().filter(|a| a.media_type == m3u8_rs::AlternativeMediaType::Audio) {
+        let Some(url) = alt.uri.as_deref().and_then(|u| base.join(u).ok()) else { continue };
+        // The codec is only named on the variants that use this group.
+        let codec = master
+            .variants
+            .iter()
+            .filter(|v| v.audio.as_deref() == Some(alt.group_id.as_str()))
+            .filter_map(|v| v.codecs.as_deref())
+            .flat_map(|c| c.split(',').map(str::trim))
+            .find(|c| c.starts_with("mp4a") || c.starts_with("opus"));
+        let mut f = hls(format!("hls-audio-{}", alt.group_id), url, StreamKind::AudioOnly);
+        f.audio_codec = Some(codec.map_or(AudioCodec::Aac, AudioCodec::from_codecs_attr));
+        f.bitrate = hls_audio_bitrate(&alt.group_id);
+        formats.push(f);
+    }
+    // One audio rendition per group is enough (groups differ by bitrate, not language).
+    formats.dedup_by(|a, b| a.id == b.id);
+    Ok(formats)
+}
+
 /// Parse `mimeType` like `video/webm; codecs="vp09.00.51.08"` into (major, container, codecs).
 fn split_mime(mime: &str) -> (&str, &str, &str) {
     let (ty, rest) = mime.split_once(';').unwrap_or((mime, ""));
@@ -137,6 +214,30 @@ mod tests {
             split_mime(r#"video/mp4; codecs="avc1.42001E, mp4a.40.2""#),
             ("video", "mp4", "avc1.42001E, mp4a.40.2")
         );
+    }
+
+    #[test]
+    fn parses_live_hls_master() {
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:URI=\"https://m.example/a233.m3u8\",TYPE=AUDIO,GROUP-ID=\"233\",NAME=\"Default\",DEFAULT=YES\n\
+            #EXT-X-MEDIA:URI=\"https://m.example/a234.m3u8\",TYPE=AUDIO,GROUP-ID=\"234\",NAME=\"Default\",DEFAULT=YES\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=269034,CODECS=\"avc1.42C00B,mp4a.40.5\",RESOLUTION=256x144,FRAME-RATE=15,AUDIO=\"233\"\n\
+            https://m.example/v144.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=4561186,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1920x1080,FRAME-RATE=30,AUDIO=\"234\"\n\
+            https://m.example/v1080.m3u8\n";
+        let base = Url::parse("https://manifest.googlevideo.com/api/manifest/hls_variant/x").expect("url");
+        let fs = parse_hls_master(master, &base).expect("parsed");
+        let ids: Vec<_> = fs.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["hls-144p", "hls-1080p", "hls-audio-233", "hls-audio-234"]);
+        let v = &fs[1];
+        assert_eq!(
+            (v.kind, v.height, v.video_codec, v.audio_codec),
+            (StreamKind::VideoOnly, Some(1080), Some(VideoCodec::H264), None)
+        );
+        assert_eq!(v.transport, Transport::Hls { live: true });
+        let a = &fs[3];
+        assert_eq!((a.kind, a.audio_codec, a.bitrate), (StreamKind::AudioOnly, Some(AudioCodec::Aac), Some(128_000)));
+        assert_eq!(a.url.as_str(), "https://m.example/a234.m3u8");
     }
 
     #[test]

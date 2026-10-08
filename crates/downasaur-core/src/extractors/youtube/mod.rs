@@ -199,8 +199,19 @@ async fn extract_with_client(
     let sts = script.as_ref().and_then(|s| s.signature_timestamp);
     let player = fetch_player_response(ctx, id, client, sts, visitor, cookie).await?;
     let mut info = parse_player_response(&player, source, kind)?;
-    if let Some(script) = &script {
-        formats::solve_challenges(&mut info, &player, script).await?;
+    let hls_manifest = at_str(&player, "streamingData/hlsManifestUrl").and_then(|u| Url::parse(u).ok());
+    match hls_manifest {
+        // Live adaptive URLs are per-segment (`sq=`) endpoints, not files: record
+        // the HLS playlists instead.
+        Some(manifest) if info.content_kind == ContentKind::LiveStream => {
+            let master = ctx.http.get_text(&manifest, DeviceClass::Desktop).await?;
+            info.formats = formats::parse_hls_master(&master, &manifest)?;
+        }
+        _ => {
+            if let Some(script) = &script {
+                formats::solve_challenges(&mut info, &player, script).await?;
+            }
+        }
     }
     // googlevideo checks that the downloader looks like the client that asked.
     for f in &mut info.formats {
