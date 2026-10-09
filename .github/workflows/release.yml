@@ -1,0 +1,66 @@
+name: Release
+
+# Pushing a tag like `v0.1.0` builds the desktop app on macOS (Apple Silicon and
+# Intel), Windows and Linux and attaches the installers to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14
+            args: --target aarch64-apple-darwin
+            rust_targets: aarch64-apple-darwin
+          - platform: macos-14
+            args: --target x86_64-apple-darwin
+            rust_targets: x86_64-apple-darwin
+          - platform: windows-latest
+            args: ""
+            rust_targets: ""
+          - platform: ubuntu-22.04
+            args: ""
+            rust_targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libsoup-3.0-dev patchelf
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.rust_targets }}
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: Downasaur 8K ${{ github.ref_name }}
+          releaseBody: |
+            Unsigned preview build. FFmpeg must be installed and on PATH (macOS: `brew install ffmpeg`, Windows: `winget install ffmpeg`).
+            macOS: if Gatekeeper blocks the app, right-click it and choose Open. Windows: SmartScreen may warn; choose "More info" then "Run anyway".
+          releaseDraft: false
+          prerelease: true
+          args: ${{ matrix.args }}
